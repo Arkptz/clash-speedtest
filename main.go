@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -54,6 +55,7 @@ var (
 	userAgent         = flag.String("ua", "", "User-Agent for fetching config from http(s) URL (default: mihomo kernel UA, e.g. mihomo/1.10.0)")
 	extraHeaders      = &headerSlice{}
 	tlsOnly           = flag.Bool("tls-only", false, "drop vless/vmess nodes without TLS/Reality")
+	parseOnly         = flag.Bool("parse-only", false, "fetch and parse proxies only (no speed test); write the full node list to -output (or stdout)")
 )
 
 type headerSlice []string
@@ -96,6 +98,32 @@ func resolveSubInputs(cliPaths string, cliHeaders []string) (string, []string, e
 		}
 	}
 	return paths, headers, nil
+}
+
+// writeFullPool marshals every parsed proxy (unfiltered, no speed test) to a
+// Clash YAML proxies block for use as a mihomo file provider. Output is sorted
+// by name for deterministic results (avoids needless provider reloads).
+func writeFullPool(proxies map[string]*speedtester.CProxy, outputPath string) error {
+	names := make([]string, 0, len(proxies))
+	for name := range proxies {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	configs := make([]map[string]any, 0, len(proxies))
+	for _, name := range names {
+		if p := proxies[name]; p != nil && p.Config != nil {
+			configs = append(configs, p.Config)
+		}
+	}
+	data, err := yaml.Marshal(&speedtester.RawConfig{Proxies: configs})
+	if err != nil {
+		return err
+	}
+	if outputPath == "" {
+		_, err = os.Stdout.Write(data)
+		return err
+	}
+	return os.WriteFile(outputPath, data, 0o644)
 }
 
 func main() {
@@ -155,6 +183,13 @@ func main() {
 	allProxies, err := speedTester.LoadProxies()
 	if err != nil {
 		log.Fatalf("load proxies failed: %s", err)
+	}
+
+	if *parseOnly {
+		if err := writeFullPool(allProxies, *outputPath); err != nil {
+			log.Fatalf("write full pool failed: %s", err)
+		}
+		return
 	}
 
 	outputMode := output.DetermineOutputMode(output.IsTerminalFile)
