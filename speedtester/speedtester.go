@@ -18,6 +18,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/provider"
+	"github.com/metacubex/mihomo/common/convert"
 	"github.com/metacubex/mihomo/constant"
 	"gopkg.in/yaml.v2"
 )
@@ -37,7 +38,9 @@ type Config struct {
 	MinUploadSpeed   float64
 	Mode             SpeedMode
 	OutputPath       string
-	UserAgent        string // optional; empty means use default (mihomo kernel UA)
+	UserAgent        string   // optional; empty means use default (mihomo kernel UA)
+	Headers          []string // extra "Key: Value" headers applied to subscription fetches (e.g. X-HWID)
+	TLSOnly          bool     // drop vless/vmess nodes without TLS/Reality (leak protection)
 }
 
 type serverMode int
@@ -65,6 +68,14 @@ func (st *SpeedTester) fetchHTTPConfig(targetURL string) ([]byte, error) {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", st.fetchConfigUA())
+	for _, h := range st.config.Headers {
+		key, value, ok := strings.Cut(h, ":")
+		if !ok || strings.TrimSpace(key) == "" {
+			log.Printf("ignoring malformed header %q (expected \"Key: Value\")", h)
+			continue
+		}
+		req.Header.Set(strings.TrimSpace(key), strings.TrimSpace(value))
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -168,6 +179,40 @@ type RawConfig struct {
 	Proxies   []map[string]any          `yaml:"proxies"`
 }
 
+// filterTLSOnly drops vless/vmess nodes lacking TLS/Reality. ConvertsV2Ray sets
+// tls=true for reality (security=reality) and tls share-links, so the tls flag
+// catches both. A reality-opts block is also treated as secure for YAML inputs
+// that omit the tls flag. Protocols encrypted by design (trojan/hysteria2/ss/
+// tuic) pass. Quoted booleans (tls: "true") are honoured so the filter does not
+// fail-closed on valid Clash YAML.
+func filterTLSOnly(proxies []map[string]any) []map[string]any {
+	filtered := make([]map[string]any, 0, len(proxies))
+	for _, m := range proxies {
+		proxyType, _ := m["type"].(string)
+		if proxyType == "vless" || proxyType == "vmess" {
+			if !isProxyTLS(m) {
+				continue
+			}
+		}
+		filtered = append(filtered, m)
+	}
+	return filtered
+}
+
+func isProxyTLS(m map[string]any) bool {
+	if _, ok := m["reality-opts"]; ok {
+		return true
+	}
+	switch tls := m["tls"].(type) {
+	case bool:
+		return tls
+	case string:
+		return strings.EqualFold(tls, "true")
+	default:
+		return false
+	}
+}
+
 func (st *SpeedTester) LoadProxies() (map[string]*CProxy, error) {
 	allProxies := make(map[string]*CProxy)
 	st.blockedNodes = make([]string, 0)
@@ -193,21 +238,36 @@ func (st *SpeedTester) LoadProxies() (map[string]*CProxy, error) {
 		rawCfg := &RawConfig{
 			Proxies: []map[string]any{},
 		}
-		if err := yaml.Unmarshal(body, rawCfg); err != nil {
-			return nil, fmt.Errorf("unable to parse config at path %s: %w, body: %s", configPath, err, body)
+		yamlErr := yaml.Unmarshal(body, rawCfg)
+		if yamlErr != nil || (len(rawCfg.Proxies) == 0 && len(rawCfg.Providers) == 0) {
+			converted, convErr := convert.ConvertsV2Ray(body)
+			if convErr != nil {
+				if yamlErr != nil {
+					return nil, fmt.Errorf("unable to parse config at path %s: yaml: %w; uri: %v", configPath, yamlErr, convErr)
+				}
+				log.Printf("no proxies found in config at path %s", configPath)
+				continue
+			}
+			rawCfg.Proxies = converted
 		}
 		proxies := make(map[string]*CProxy)
 		proxiesConfig := rawCfg.Proxies
 		providersConfig := rawCfg.Providers
 
-		for i, config := range proxiesConfig {
+		if st.config.TLSOnly {
+			proxiesConfig = filterTLSOnly(proxiesConfig)
+		}
+
+		for _, config := range proxiesConfig {
 			proxy, err := adapter.ParseProxy(config)
 			if err != nil {
-				return nil, fmt.Errorf("proxy %d: %w", i, err)
+				log.Printf("skip unparseable proxy: %s", err)
+				continue
 			}
 
 			if _, exist := proxies[proxy.Name()]; exist {
-				return nil, fmt.Errorf("proxy %s is the duplicate name", proxy.Name())
+				log.Printf("skip duplicate proxy name %q (keeping first occurrence)", proxy.Name())
+				continue
 			}
 			proxies[proxy.Name()] = &CProxy{Proxy: proxy, Config: config}
 		}
@@ -297,7 +357,11 @@ func (st *SpeedTester) LoadProxies() (map[string]*CProxy, error) {
 			filteredProxies[name] = allProxies[name]
 		}
 	}
-	return deduplicateProxiesByServerPort(filteredProxies), nil
+	result := deduplicateProxiesByServerPort(filteredProxies)
+	if len(result) == 0 {
+		return nil, fmt.Errorf("no usable proxies loaded from %q (all sources empty, unparseable, or filtered out)", st.config.ConfigPaths)
+	}
+	return result, nil
 }
 
 func deduplicateProxiesByServerPort(proxies map[string]*CProxy) map[string]*CProxy {

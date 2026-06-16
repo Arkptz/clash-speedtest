@@ -52,7 +52,22 @@ var (
 	fastMode          = flag.Bool("fast", false, "fast mode (alias for --speed-mode fast)")
 	versionFlag       = flag.Bool("v", false, "show version information")
 	userAgent         = flag.String("ua", "", "User-Agent for fetching config from http(s) URL (default: mihomo kernel UA, e.g. mihomo/1.10.0)")
+	extraHeaders      = &headerSlice{}
+	tlsOnly           = flag.Bool("tls-only", false, "drop vless/vmess nodes without TLS/Reality")
 )
+
+type headerSlice []string
+
+func (h *headerSlice) String() string { return strings.Join(*h, ", ") }
+
+func (h *headerSlice) Set(value string) error {
+	*h = append(*h, value)
+	return nil
+}
+
+func init() {
+	flag.Var(extraHeaders, "H", "extra HTTP header for subscription fetch, repeatable (e.g. -H 'X-HWID: router-001')")
+}
 
 func main() {
 	flag.Parse()
@@ -93,6 +108,8 @@ func main() {
 		Mode:             requestedMode,
 		OutputPath:       *outputPath,
 		UserAgent:        *userAgent,
+		Headers:          []string(*extraHeaders),
+		TLSOnly:          *tlsOnly,
 	})
 	if err != nil {
 		log.Fatalf("create speed tester failed: %s", err)
