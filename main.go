@@ -69,6 +69,35 @@ func init() {
 	flag.Var(extraHeaders, "H", "extra HTTP header for subscription fetch, repeatable (e.g. -H 'X-HWID: router-001')")
 }
 
+// resolveSubInputs lets the subscription URL/path and headers come from the
+// environment or a file instead of argv, so secret tokens and X-HWID values are
+// never exposed via ps or /proc/<pid>/cmdline. Precedence for the path: the -c
+// flag, otherwise CLASH_SPEEDTEST_SUB_URL. A leading '@' makes the resolved
+// value a file to read the URL/path list from. CLASH_SPEEDTEST_HEADERS holds
+// newline-separated "Key: Value" headers appended to any -H flags.
+func resolveSubInputs(cliPaths string, cliHeaders []string) (string, []string, error) {
+	paths := cliPaths
+	if paths == "" {
+		paths = os.Getenv("CLASH_SPEEDTEST_SUB_URL")
+	}
+	if strings.HasPrefix(paths, "@") {
+		data, err := os.ReadFile(strings.TrimPrefix(paths, "@"))
+		if err != nil {
+			return "", nil, fmt.Errorf("read config path file: %w", err)
+		}
+		paths = strings.TrimSpace(string(data))
+	}
+	headers := append([]string(nil), cliHeaders...)
+	if env := os.Getenv("CLASH_SPEEDTEST_HEADERS"); env != "" {
+		for _, line := range strings.Split(env, "\n") {
+			if line = strings.TrimSpace(line); line != "" {
+				headers = append(headers, line)
+			}
+		}
+	}
+	return paths, headers, nil
+}
+
 func main() {
 	flag.Parse()
 	mihomolog.SetLevel(mihomolog.SILENT)
@@ -79,11 +108,13 @@ func main() {
 		os.Exit(0)
 	}
 
-	if *configPathsConfig == "" {
-		log.Fatalln("please specify the configuration file")
+	configPaths, headers, err := resolveSubInputs(*configPathsConfig, []string(*extraHeaders))
+	if err != nil {
+		log.Fatalf("resolve subscription inputs failed: %s", err)
 	}
-
-	var err error
+	if configPaths == "" {
+		log.Fatalln("please specify the configuration file (via -c, @file, or CLASH_SPEEDTEST_SUB_URL)")
+	}
 	requestedMode := speedtester.SpeedModeFast
 	if !*fastMode {
 		requestedMode, err = speedtester.ParseSpeedMode(*speedMode)
@@ -93,7 +124,7 @@ func main() {
 	}
 
 	speedTester, err := speedtester.New(&speedtester.Config{
-		ConfigPaths:      *configPathsConfig,
+		ConfigPaths:      configPaths,
 		FilterRegex:      *filterRegexConfig,
 		BlockRegex:       *blockKeywords,
 		ServerURL:        *serverURL,
@@ -108,7 +139,7 @@ func main() {
 		Mode:             requestedMode,
 		OutputPath:       *outputPath,
 		UserAgent:        *userAgent,
-		Headers:          []string(*extraHeaders),
+		Headers:          headers,
 		TLSOnly:          *tlsOnly,
 	})
 	if err != nil {
